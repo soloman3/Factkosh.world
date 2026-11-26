@@ -407,7 +407,7 @@ fetch("data/news.json?v=" + Date.now()).then(r => r.ok ? r.json() : []).catch(()
 
 /* ---------- password gate ---------- */
 (function(){
-  const HASH = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
+  const HASH = "4b090a27a9b25b67420f20adbbfc616c0f6b014ecfd628c1937f62f2bb846f4e";
   const KEY = "fk-auth";
   const sha = async t => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map(b => b.toString(16).padStart(2,"0")).join("");
   const unlock = () => { document.documentElement.classList.remove("locked"); startApp(); };
