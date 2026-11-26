@@ -1,0 +1,228 @@
+name: Daily Crime News
+
+on:
+  schedule:
+    - cron: "30 1 * * *"   # roz subah 7:00 IST
+    - cron: "30 13 * * *"  # roz shaam 7:00 IST
+  workflow_dispatch:        # Actions tab se khud bhi chala sakte ho
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch news
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cat > /tmp/fetch_news.py <<'PY'
+          """FactKosh Crime Tracker - daily news agent.
+          Runs on GitHub Actions. Fetches crime headlines from Google News RSS,
+          asks Gemini (with Google Search) for the key facts, and appends them to
+          data/news.json. Old entries are never deleted.
+          """
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta, timezone
+          from email.utils import parsedate_to_datetime
+
+          DATA_FILE = "data/news.json"
+          MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+          API_KEY = os.environ.get("GEMINI_API_KEY", "")
+          MAX_NEW = int(os.environ.get("MAX_NEW", "30"))  # stories per run
+          PER_CAT = int(os.environ.get("PER_CAT", "3"))   # max stories per category per run
+          IST = timezone(timedelta(hours=5, minutes=30))
+
+          # Category name -> Google News search query. Add/remove freely.
+          CATEGORIES = {
+              "Loot / Dacoity": "robbery OR dacoity OR loot",
+              "Bank & ATM Robbery": '"bank robbery" OR "ATM robbery" OR "ATM loot"',
+              "Jewellery Heist": "jewellery heist OR jewelry store robbery",
+              "Murder": "murder arrested OR \"shot dead\" OR \"killed\" police",
+              "Kidnapping": "kidnapping OR abducted ransom",
+              "Cyber Fraud": '"cyber fraud" OR "online scam" OR "digital arrest"',
+              "Scam / Ponzi": '"ponzi scheme" OR "investment fraud" OR "chit fund scam"',
+              "Drug Bust": '"drugs seized" OR "drug bust" OR narcotics seized',
+              "Smuggling": '"gold smuggling" OR smuggling seized customs',
+              "Chain Snatching / Theft": '"chain snatching" OR "vehicle theft" OR burglary',
+          }
+
+          UA = {"User-Agent": "Mozilla/5.0 (FactKosh news bot)"}
+
+
+          def http_get(url):
+              req = urllib.request.Request(url, headers=UA)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read()
+
+
+          def google_news(query):
+              params = {"q": f"{query} when:1d", "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
+              url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(params)
+              root = ET.fromstring(http_get(url))
+              items = []
+              for it in root.iter("item"):
+                  title = (it.findtext("title") or "").strip()
+                  source = (it.findtext("source") or "").strip()
+                  if source and title.endswith(" - " + source):
+                      title = title[: -len(source) - 3].strip()
+                  pub = it.findtext("pubDate")
+                  try:
+                      dt = parsedate_to_datetime(pub).astimezone(IST)
+                  except Exception:
+                      dt = datetime.now(IST)
+                  items.append({
+                      "title": title,
+                      "link": (it.findtext("link") or "").strip(),
+                      "source": source,
+                      "date": dt.strftime("%Y-%m-%d"),
+                      "time": dt.strftime("%H:%M"),
+                  })
+              return items
+
+
+          PROMPT = """You are a careful crime-news fact extractor.
+          Use Google Search to find the facts behind this news report.
+
+          Headline: {title}
+          Publisher: {source}
+          Date: {date}
+
+          Reply with ONLY one JSON object, no other text, with these keys:
+          "is_crime_news": true or false,
+          "country": country name or null,
+          "city": city/area or null,
+          "amount_stolen": amount as reported with currency (e.g. "Rs 2.5 crore", "$1.2 million") or null,
+          "deaths": integer or null,
+          "injured": integer or null,
+          "arrest_status": one of "Arrested", "Some arrested", "Not arrested", "Unknown",
+          "headline_hinglish": short headline in Hinglish (Hindi written in Roman/English letters, mixed with English words), e.g. "Patna mein bank se 2 crore ki loot, 3 aaropi giraftaar",
+          "summary": 2-3 sentences in Hinglish (Roman script), in your OWN words, do not copy article text.
+          Use null / "Unknown" when a fact is not reported. Never guess numbers."""
+
+
+          def ask_gemini(item):
+              url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                     f"{MODEL}:generateContent?key={API_KEY}")
+              body = {
+                  "contents": [{"parts": [{"text": PROMPT.format(**item)}]}],
+                  "tools": [{"google_search": {}}],
+              }
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json"}, method="POST")
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  resp = json.load(r)
+              parts = resp["candidates"][0]["content"]["parts"]
+              text = "".join(p.get("text", "") for p in parts)
+              match = re.search(r"\{.*\}", text, re.S)
+              return json.loads(match.group(0)) if match else None
+
+
+          def wiki_photo(*places):
+              """Free, licensed photo of the city/country from Wikipedia (Wikimedia Commons)."""
+              for place in places:
+                  if not place:
+                      continue
+                  try:
+                      url = ("https://en.wikipedia.org/api/rest_v1/page/summary/"
+                             + urllib.parse.quote(place.replace(" ", "_")))
+                      data = json.loads(http_get(url))
+                      img = (data.get("thumbnail") or {}).get("source")
+                      if img and data.get("type") == "standard":
+                          return {"image": img, "image_credit": "Wikipedia / Wikimedia Commons",
+                                  "image_page": data.get("content_urls", {}).get("desktop", {}).get("page")}
+                  except Exception:
+                      pass
+              return {}
+
+
+          def norm(title):
+              return re.sub(r"[^a-z0-9]", "", title.lower())[:80]
+
+
+          def main():
+              os.makedirs("data", exist_ok=True)
+              try:
+                  with open(DATA_FILE, encoding="utf-8") as f:
+                      news = json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  news = []
+
+              seen_links = {n["link"] for n in news}
+              seen_titles = {norm(n["title"]) for n in news}
+
+              candidates = []
+              for category, query in CATEGORIES.items():
+                  taken = 0
+                  try:
+                      for item in google_news(query):
+                          if taken >= PER_CAT:
+                              break
+                          if item["link"] in seen_links or norm(item["title"]) in seen_titles:
+                              continue
+                          item["category"] = category
+                          seen_links.add(item["link"])
+                          seen_titles.add(norm(item["title"]))
+                          candidates.append(item)
+                          taken += 1
+                  except Exception as e:
+                      print(f"[warn] feed failed for {category}: {e}")
+
+              print(f"{len(candidates)} new headlines, processing up to {MAX_NEW}")
+              added = 0
+              for item in candidates[:MAX_NEW]:
+                  facts = None
+                  if API_KEY:
+                      try:
+                          facts = ask_gemini(item)
+                      except Exception as e:
+                          print(f"[warn] gemini failed: {e}")
+                      time.sleep(5)  # stay inside free-tier rate limits
+                  if facts and facts.get("is_crime_news") is False:
+                      continue
+                  facts = facts or {}
+                  item.update({
+                      "id": hashlib.sha1(item["link"].encode()).hexdigest()[:12],
+                      "country": facts.get("country"),
+                      "city": facts.get("city"),
+                      "amount_stolen": facts.get("amount_stolen"),
+                      "deaths": facts.get("deaths"),
+                      "injured": facts.get("injured"),
+                      "arrest_status": facts.get("arrest_status") or "Unknown",
+                      "headline_hinglish": facts.get("headline_hinglish") or "",
+                      "summary": facts.get("summary") or "",
+                  })
+                  item.update(wiki_photo(item["city"], item["country"]))
+                  news.append(item)
+                  added += 1
+
+              news.sort(key=lambda n: (n["date"], n.get("time", "")), reverse=True)
+              with open(DATA_FILE, "w", encoding="utf-8") as f:
+                  json.dump(news, f, ensure_ascii=False, indent=1)
+              print(f"Added {added}. Total stories: {len(news)}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python /tmp/fetch_news.py
+      - name: Commit
+        run: |
+          git config user.name "factkosh-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/news.json
+          git diff --cached --quiet || git commit -m "News update $(date -u +%F)"
+          git push
